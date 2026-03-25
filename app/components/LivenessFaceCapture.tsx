@@ -45,7 +45,7 @@ function calculateEAR(landmarks: faceapi.FaceLandmarks68) {
 /* ──────────────────────────────────────────────
    THRESHOLDS
    ────────────────────────────────────────────── */
-const EAR_CLOSED_THRESHOLD = 0.22; // EAR below this is considered a blink
+const EAR_CLOSED_THRESHOLD = 0.20; // EAR below this is considered a blink
 
 /* ──────────────────────────────────────────────
    INSTRUCTIONS MAP
@@ -82,6 +82,8 @@ export default function LivenessFaceCapture({
 
   // Blink State tracking
   const hasClosedEyesRef = useRef<boolean>(false);
+  const frameCountRef = useRef<number>(0);
+  const lostFramesRef = useRef<number>(0);
 
   const updateState = useCallback((newState: LivenessState) => {
     stateRef.current = newState;
@@ -175,13 +177,18 @@ export default function LivenessFaceCapture({
         const detection = await faceapi
           .detectSingleFace(
             videoRef.current,
-            new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.5 })
           )
           .withFaceLandmarks();
 
         if (detection) {
+          lostFramesRef.current = 0;
           const currentEar = calculateEAR(detection.landmarks);
-          setEar(Number(currentEar.toFixed(2)));
+          
+          frameCountRef.current++;
+          if (frameCountRef.current % 5 === 0) {
+            setEar(Number(currentEar.toFixed(2)));
+          }
 
           // Draw overlay on canvas
           drawOverlay(detection, currentEar);
@@ -196,9 +203,16 @@ export default function LivenessFaceCapture({
               // Eyes opened again after being closed -> Blink complete!
               updateState("VERIFYING");
               hasClosedEyesRef.current = false;
-              await captureAndVerify();
+              captureAndVerify();
               return;
             }
+          }
+        } else if (stateRef.current === "BLINK") {
+          lostFramesRef.current++;
+          if (lostFramesRef.current > 15) {
+             hasClosedEyesRef.current = false;
+             updateState("FAILED");
+             return;
           }
         }
       } catch (err) {
@@ -258,13 +272,22 @@ export default function LivenessFaceCapture({
   async function captureAndVerify() {
     if (!videoRef.current) return;
 
-    const detection = await faceapi
-      .detectSingleFace(
-        videoRef.current,
-        new faceapi.TinyFaceDetectorOptions()
-      )
-      .withFaceLandmarks()
-      .withFaceDescriptor();
+    let detection = null;
+    let attempts = 0;
+    
+    while (!detection && attempts < 5) {
+      detection = await faceapi
+        .detectSingleFace(
+          videoRef.current,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 160 })
+        )
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      attempts++;
+      if (!detection) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }
 
     if (!detection) {
       updateState("FAILED");
