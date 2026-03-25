@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import FaceCapture from "@/app/components/FaceCapture";
+import LivenessFaceCapture from "@/app/components/LivenessFaceCapture";
 import MobileBottomNav from "@/app/components/MobileBottomNav";
 
 /* ---------- CONFIG ---------- */
@@ -409,14 +409,17 @@ export default function Attendance() {
           </div>
         )}
 
-        {/* ── Face Verification ── */}
+        {/* ── Face Verification with Liveness ── */}
         {showFace && (
-          <div className="space-y-3">
-            <p className="text-sm text-center text-gray-600">
-              Face Verification
-            </p>
-            <FaceCapture onCapture={handleFaceVerified} />
-          </div>
+          <LivenessFaceCapture
+            onCapture={handleFaceVerified}
+            onCancel={() => {
+              setShowFace(false);
+              setPunchAction(null);
+              setStatus(null);
+            }}
+            timeoutSeconds={10}
+          />
         )}
       </div>
 
