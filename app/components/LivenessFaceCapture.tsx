@@ -74,7 +74,7 @@ export default function LivenessFaceCapture({
 
   const [state, setState] = useState<LivenessState>("LOADING");
   const [modelsReady, setModelsReady] = useState(false);
-  const [ear, setEar] = useState(0);
+  const earTextRef = useRef<HTMLDivElement>(null);
 
   // Refs for state machine (used inside animation loop to avoid stale closures)
   const stateRef = useRef<LivenessState>("LOADING");
@@ -82,7 +82,6 @@ export default function LivenessFaceCapture({
 
   // Blink State tracking
   const hasClosedEyesRef = useRef<boolean>(false);
-  const frameCountRef = useRef<number>(0);
   const lostFramesRef = useRef<number>(0);
 
   const updateState = useCallback((newState: LivenessState) => {
@@ -138,7 +137,7 @@ export default function LivenessFaceCapture({
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
       if (animFrameRef.current) {
-        cancelAnimationFrame(animFrameRef.current);
+        clearTimeout(animFrameRef.current);
       }
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
@@ -153,76 +152,64 @@ export default function LivenessFaceCapture({
     hasClosedEyesRef.current = false;
   }
 
-  /* ── Detection Loop ── */
+  /* ── Optimized Detection Loop ── */
   function runDetectionLoop() {
-    async function detect() {
-      const currentState = stateRef.current;
+    const detect = async () => {
+      // 1. Exit early if the component is in a terminal state
+      const cs = stateRef.current;
+      if (cs === "SUCCESS" || cs === "FAILED" || cs === "VERIFYING" || cs === "LOADING") return;
 
-      // Stop conditions
-      if (
-        currentState === "VERIFYING" ||
-        currentState === "SUCCESS" ||
-        currentState === "FAILED" ||
-        currentState === "LOADING"
-      ) {
-        return;
-      }
+      if (videoRef.current && videoRef.current.readyState >= 2) {
+        try {
+          const detection = await faceapi
+            .detectSingleFace(
+              videoRef.current,
+              // 2. Drop inputSize to 128 for a massive speed boost
+              new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.5 })
+            )
+            .withFaceLandmarks();
 
-      if (!videoRef.current || videoRef.current.readyState < 2) {
-        animFrameRef.current = requestAnimationFrame(detect);
-        return;
-      }
+          if (detection) {
+            lostFramesRef.current = 0;
+            const currentEar = calculateEAR(detection.landmarks);
 
-      try {
-        const detection = await faceapi
-          .detectSingleFace(
-            videoRef.current,
-            new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.5 })
-          )
-          .withFaceLandmarks();
+            // 3. DIRECT DOM UPDATE (Zero Re-renders)
+            if (earTextRef.current) {
+              earTextRef.current.innerText = `EAR: ${currentEar.toFixed(2)}`;
+            }
 
-        if (detection) {
-          lostFramesRef.current = 0;
-          const currentEar = calculateEAR(detection.landmarks);
-          
-          frameCountRef.current++;
-          if (frameCountRef.current % 5 === 0) {
-            setEar(Number(currentEar.toFixed(2)));
-          }
+            drawOverlay(detection, currentEar);
 
-          // Draw overlay on canvas
-          drawOverlay(detection, currentEar);
-
-          // State machine transitions
-          const cs = stateRef.current;
-
-          if (cs === "BLINK") {
-            if (currentEar < EAR_CLOSED_THRESHOLD) {
-              hasClosedEyesRef.current = true;
-            } else if (hasClosedEyesRef.current && currentEar >= EAR_CLOSED_THRESHOLD) {
-              // Eyes opened again after being closed -> Blink complete!
-              updateState("VERIFYING");
-              hasClosedEyesRef.current = false;
-              captureAndVerify();
-              return;
+            // 4. State Logic (Only updates React when the state actually CHANGES)
+            if (cs === "BLINK") {
+              if (currentEar < EAR_CLOSED_THRESHOLD) {
+                hasClosedEyesRef.current = true;
+              } else if (hasClosedEyesRef.current && currentEar >= EAR_CLOSED_THRESHOLD) {
+                updateState("VERIFYING");
+                hasClosedEyesRef.current = false;
+                captureAndVerify();
+                return; // Stop the loop
+              }
+            }
+          } else if (cs === "BLINK") {
+            // Handle lost face logic...
+            lostFramesRef.current++;
+            if (lostFramesRef.current > 15) {
+               hasClosedEyesRef.current = false;
+               updateState("FAILED");
+               return;
             }
           }
-        } else if (stateRef.current === "BLINK") {
-          lostFramesRef.current++;
-          if (lostFramesRef.current > 15) {
-             hasClosedEyesRef.current = false;
-             updateState("FAILED");
-             return;
-          }
+        } catch (err) {
+          console.error("Detection error:", err);
         }
-      } catch (err) {
-        console.error("Detection error:", err);
       }
 
-      animFrameRef.current = requestAnimationFrame(detect);
-    }
+      // 5. Schedule next check. 30-40ms is plenty for liveness and saves CPU.
+      animFrameRef.current = window.setTimeout(detect, 33);
+    };
 
-    animFrameRef.current = requestAnimationFrame(detect);
+    detect();
   }
 
   /* ── Draw Face Overlay ── */
@@ -305,7 +292,9 @@ export default function LivenessFaceCapture({
 
   /* ── Retry ── */
   function handleRetry() {
-    setEar(0);
+    if (earTextRef.current) {
+      earTextRef.current.innerText = "EAR: 0.00";
+    }
     hasClosedEyesRef.current = false;
     updateState("WAITING");
     runDetectionLoop();
@@ -366,10 +355,13 @@ export default function LivenessFaceCapture({
           style={{ transform: "scaleX(-1)" }}
         />
 
-        {/* Live EAR Indicator */}
+        {/* Live EAR Indicator (Updated via Ref for performance) */}
         {isActive && (
-          <div className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg font-mono">
-            EAR: {ear.toFixed(2)}
+          <div 
+            ref={earTextRef}
+            className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg font-mono"
+          >
+            EAR: 0.00
           </div>
         )}
       </div>
