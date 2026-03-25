@@ -15,62 +15,37 @@ type Props = {
 type LivenessState =
   | "LOADING"
   | "WAITING"
-  | "LOOK_LEFT"
-  | "LOOK_RIGHT"
-  | "LOOK_DOWN"
+  | "BLINK"
   | "VERIFYING"
   | "SUCCESS"
   | "FAILED";
 
 /* ──────────────────────────────────────────────
-   HEAD POSE ESTIMATION (from 68 landmarks)
-   
-   Uses a simplified ear–nose–chin geometry:
-     Yaw  → horizontal ratio of nose tip between left/right ear
-     Pitch → vertical drop of nose tip relative to eye line
+   EYE BLINK DETECTION (EAR)
    ────────────────────────────────────────────── */
-function estimateHeadPose(landmarks: faceapi.FaceLandmarks68) {
+function calculateEAR(landmarks: faceapi.FaceLandmarks68) {
   const pts = landmarks.positions;
 
-  // Key points (0-indexed from 68-landmark model)
-  const noseTip = pts[30];    // tip of nose
-  const leftEar = pts[0];     // left jaw edge (right side of screen)
-  const rightEar = pts[16];   // right jaw edge (left side of screen)
-  const leftEye = pts[36];    // left eye outer corner
-  const rightEye = pts[45];   // right eye outer corner
-  const chin = pts[8];        // bottom of chin
+  // Helper function to calculate Euclidean distance
+  const dist = (p1: faceapi.Point, p2: faceapi.Point) =>
+    Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
 
-  // ── YAW (left-right) ──
-  // Ratio of nose position between ear edges
-  // 0.5 = facing straight, < 0.5 = looking right, > 0.5 = looking left
-  const faceWidth = rightEar.x - leftEar.x;
-  const noseOffset = noseTip.x - leftEar.x;
-  const yawRatio = faceWidth !== 0 ? noseOffset / faceWidth : 0.5;
+  // Left eye (indices 36-41)
+  const leftEyeEAR =
+    (dist(pts[37], pts[41]) + dist(pts[38], pts[40])) / (2.0 * dist(pts[36], pts[39]));
 
-  // Convert to approximate degrees (-45 to +45)
-  // Center at 0.5, positive = looking left, negative = looking right
-  const yawDeg = (yawRatio - 0.5) * 90;
+  // Right eye (indices 42-47)
+  const rightEyeEAR =
+    (dist(pts[43], pts[47]) + dist(pts[44], pts[46])) / (2.0 * dist(pts[42], pts[45]));
 
-  // ── PITCH (up-down) ──
-  // Ratio of nose-to-chin vs eye-to-chin distance
-  const eyeCenterY = (leftEye.y + rightEye.y) / 2;
-  const eyeToChin = chin.y - eyeCenterY;
-  const noseToChin = chin.y - noseTip.y;
-  const pitchRatio = eyeToChin !== 0 ? noseToChin / eyeToChin : 0.5;
-
-  // Normal pitch ratio ~0.55-0.65. Lower = looking down, Higher = looking up
-  // Convert to approximate degrees
-  const pitchDeg = (pitchRatio - 0.6) * -100;
-
-  return { yawRatio, pitchRatio, yawDeg, pitchDeg };
+  // Average EAR
+  return (leftEyeEAR + rightEyeEAR) / 2.0;
 }
 
 /* ──────────────────────────────────────────────
    THRESHOLDS
    ────────────────────────────────────────────── */
-const YAW_LEFT_THRESHOLD_OFFSET = 0.15;    // +15% from baseline (looking left)
-const YAW_RIGHT_THRESHOLD_OFFSET = -0.15;  // -15% from baseline (looking right)
-const PITCH_DOWN_THRESHOLD_OFFSET = -0.10; // -10% from baseline (looking down)
+const EAR_CLOSED_THRESHOLD = 0.22; // EAR below this is considered a blink
 
 /* ──────────────────────────────────────────────
    INSTRUCTIONS MAP
@@ -78,9 +53,7 @@ const PITCH_DOWN_THRESHOLD_OFFSET = -0.10; // -10% from baseline (looking down)
 const INSTRUCTIONS: Record<LivenessState, { text: string; emoji: string }> = {
   LOADING:   { text: "Loading face detection models…", emoji: "⏳" },
   WAITING:   { text: "Position your face in the frame", emoji: "🧑" },
-  LOOK_LEFT: { text: "Turn your head LEFT", emoji: "👈" },
-  LOOK_RIGHT:{ text: "Now turn your head RIGHT", emoji: "👉" },
-  LOOK_DOWN: { text: "Now look DOWN", emoji: "👇" },
+  BLINK:     { text: "Please BLINK your eyes", emoji: "👁️" },
   VERIFYING: { text: "Liveness verified! Capturing face…", emoji: "📸" },
   SUCCESS:   { text: "Face captured successfully!", emoji: "✅" },
   FAILED:    { text: "Detection lost. Please try again.", emoji: "⚠️" },
@@ -101,19 +74,14 @@ export default function LivenessFaceCapture({
 
   const [state, setState] = useState<LivenessState>("LOADING");
   const [modelsReady, setModelsReady] = useState(false);
-  const [yaw, setYaw] = useState(0);
-  const [pitch, setPitch] = useState(0);
+  const [ear, setEar] = useState(0);
 
   // Refs for state machine (used inside animation loop to avoid stale closures)
   const stateRef = useRef<LivenessState>("LOADING");
   const startTimeRef = useRef<number>(0);
 
-  // Fast-Capture Optimizations Refs
-  const baselineYawRef = useRef<number>(0.5);
-  const baselinePitchRef = useRef<number>(0.6);
-  const smoothedYawRef = useRef<number | null>(null);
-  const smoothedPitchRef = useRef<number | null>(null);
-  const successTimerRef = useRef<number>(0);
+  // Blink State tracking
+  const hasClosedEyesRef = useRef<boolean>(false);
 
   const updateState = useCallback((newState: LivenessState) => {
     stateRef.current = newState;
@@ -178,8 +146,9 @@ export default function LivenessFaceCapture({
 
   /* ── Start Liveness Challenge ── */
   function startChallenge() {
-    updateState("LOOK_LEFT");
+    updateState("BLINK");
     startTimeRef.current = Date.now();
+    hasClosedEyesRef.current = false;
   }
 
   /* ── Detection Loop ── */
@@ -211,52 +180,25 @@ export default function LivenessFaceCapture({
           .withFaceLandmarks();
 
         if (detection) {
-          const { yawRatio, pitchRatio, yawDeg, pitchDeg } = estimateHeadPose(detection.landmarks);
-
-          if (smoothedYawRef.current === null || smoothedPitchRef.current === null) {
-            smoothedYawRef.current = yawDeg;
-            smoothedPitchRef.current = pitchDeg;
-          } else {
-            smoothedYawRef.current = smoothedYawRef.current * 0.8 + yawDeg * 0.2;
-            smoothedPitchRef.current = smoothedPitchRef.current * 0.8 + pitchDeg * 0.2;
-          }
-
-          setYaw(Math.round(smoothedYawRef.current));
-          setPitch(Math.round(smoothedPitchRef.current));
+          const currentEar = calculateEAR(detection.landmarks);
+          setEar(Number(currentEar.toFixed(2)));
 
           // Draw overlay on canvas
-          drawOverlay(detection, smoothedYawRef.current, smoothedPitchRef.current);
+          drawOverlay(detection, currentEar);
 
           // State machine transitions
           const cs = stateRef.current;
 
-          if (cs === "WAITING") {
-            baselineYawRef.current = yawRatio;
-            baselinePitchRef.current = pitchRatio;
-            successTimerRef.current = 0;
-          } else if (cs === "LOOK_LEFT" && yawRatio > baselineYawRef.current + YAW_LEFT_THRESHOLD_OFFSET) {
-            if (!successTimerRef.current) successTimerRef.current = Date.now();
-            if (Date.now() - successTimerRef.current > 200) {
-              updateState("LOOK_RIGHT");
-              successTimerRef.current = 0;
-            }
-          } else if (cs === "LOOK_RIGHT" && yawRatio < baselineYawRef.current + YAW_RIGHT_THRESHOLD_OFFSET) {
-            if (!successTimerRef.current) successTimerRef.current = Date.now();
-            if (Date.now() - successTimerRef.current > 200) {
-              updateState("LOOK_DOWN");
-              successTimerRef.current = 0;
-            }
-          } else if (cs === "LOOK_DOWN" && pitchRatio < baselinePitchRef.current + PITCH_DOWN_THRESHOLD_OFFSET) {
-            if (!successTimerRef.current) successTimerRef.current = Date.now();
-            if (Date.now() - successTimerRef.current > 200) {
+          if (cs === "BLINK") {
+            if (currentEar < EAR_CLOSED_THRESHOLD) {
+              hasClosedEyesRef.current = true;
+            } else if (hasClosedEyesRef.current && currentEar >= EAR_CLOSED_THRESHOLD) {
+              // Eyes opened again after being closed -> Blink complete!
               updateState("VERIFYING");
-              successTimerRef.current = 0;
+              hasClosedEyesRef.current = false;
               await captureAndVerify();
               return;
             }
-          } else {
-            // Reset delay if pose leaves threshold
-            successTimerRef.current = 0;
           }
         }
       } catch (err) {
@@ -272,8 +214,7 @@ export default function LivenessFaceCapture({
   /* ── Draw Face Overlay ── */
   function drawOverlay(
     detection: faceapi.WithFaceLandmarks<{ detection: faceapi.FaceDetection }>,
-    yawDeg: number,
-    pitchDeg: number
+    earValue: number
   ) {
     const canvas = canvasRef.current;
     const video = videoRef.current;
@@ -290,11 +231,7 @@ export default function LivenessFaceCapture({
     // Draw face bounding box
     const box = detection.detection.box;
     const cs = stateRef.current;
-    const color =
-      cs === "LOOK_LEFT" ? "#3B82F6" :
-      cs === "LOOK_RIGHT" ? "#8B5CF6" :
-      cs === "LOOK_DOWN" ? "#F59E0B" :
-      "#22C55E";
+    const color = cs === "BLINK" ? "#3B82F6" : "#22C55E";
 
     ctx.strokeStyle = color;
     ctx.lineWidth = 3;
@@ -308,13 +245,12 @@ export default function LivenessFaceCapture({
       ctx.fill();
     });
 
-    // Yaw/Pitch text
+    // EAR text
     ctx.fillStyle = "#fff";
     ctx.font = "bold 14px monospace";
     ctx.shadowColor = "#000";
     ctx.shadowBlur = 4;
-    ctx.fillText(`Yaw: ${Math.round(yawDeg)}°`, 10, 25);
-    ctx.fillText(`Pitch: ${Math.round(pitchDeg)}°`, 10, 45);
+    ctx.fillText(`EAR: ${earValue.toFixed(2)}`, 10, 25);
     ctx.shadowBlur = 0;
   }
 
@@ -346,25 +282,18 @@ export default function LivenessFaceCapture({
 
   /* ── Retry ── */
   function handleRetry() {
-    setYaw(0);
-    setPitch(0);
-    smoothedYawRef.current = null;
-    smoothedPitchRef.current = null;
-    successTimerRef.current = 0;
+    setEar(0);
+    hasClosedEyesRef.current = false;
     updateState("WAITING");
     runDetectionLoop();
   }
 
   /* ── UI ── */
   const info = INSTRUCTIONS[state];
-  const isActive = ["LOOK_LEFT", "LOOK_RIGHT", "LOOK_DOWN"].includes(state);
+  const isActive = state === "BLINK";
 
   // Progress indicator
-  const stepsDone =
-    state === "LOOK_LEFT" ? 0 :
-    state === "LOOK_RIGHT" ? 1 :
-    state === "LOOK_DOWN" ? 2 :
-    state === "VERIFYING" || state === "SUCCESS" ? 3 : 0;
+  const stepsDone = state === "VERIFYING" || state === "SUCCESS" ? 1 : 0;
 
   return (
     <div className="space-y-4">
@@ -386,20 +315,15 @@ export default function LivenessFaceCapture({
       {/* ── Progress Steps ── */}
       {(isActive || state === "VERIFYING" || state === "SUCCESS") && (
         <div className="flex justify-center gap-2">
-          {["Left", "Right", "Down"].map((label, i) => (
-            <div
-              key={label}
-              className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium transition-all ${
-                i < stepsDone
-                  ? "bg-green-500 text-white"
-                  : i === stepsDone && isActive
-                  ? "bg-blue-500 text-white animate-pulse"
-                  : "bg-gray-200 text-gray-500"
-              }`}
-            >
-              {i < stepsDone ? "✓" : i + 1} {label}
-            </div>
-          ))}
+          <div
+            className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium transition-all ${
+              stepsDone === 1
+                ? "bg-green-500 text-white"
+                : "bg-blue-500 text-white animate-pulse"
+            }`}
+          >
+            {stepsDone === 1 ? "✓ Verified" : "Blink 1 Time"}
+          </div>
         </div>
       )}
 
@@ -419,10 +343,10 @@ export default function LivenessFaceCapture({
           style={{ transform: "scaleX(-1)" }}
         />
 
-        {/* Live Yaw/Pitch Indicator */}
+        {/* Live EAR Indicator */}
         {isActive && (
           <div className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg font-mono">
-            Y:{yaw}° P:{pitch}°
+            EAR: {ear.toFixed(2)}
           </div>
         )}
       </div>
