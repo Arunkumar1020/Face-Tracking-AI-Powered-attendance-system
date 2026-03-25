@@ -103,7 +103,6 @@ export default function LivenessFaceCapture({
 
   const [state, setState] = useState<LivenessState>("LOADING");
   const [modelsReady, setModelsReady] = useState(false);
-  const [remainingTime, setRemainingTime] = useState(timeoutSeconds);
   const [yaw, setYaw] = useState(0);
   const [pitch, setPitch] = useState(0);
 
@@ -173,7 +172,6 @@ export default function LivenessFaceCapture({
   function startChallenge() {
     updateState("LOOK_LEFT");
     startTimeRef.current = Date.now();
-    setRemainingTime(timeoutSeconds);
     runDetectionLoop();
   }
 
@@ -189,16 +187,6 @@ export default function LivenessFaceCapture({
         currentState === "TIMEOUT" ||
         currentState === "LOADING"
       ) {
-        return;
-      }
-
-      // Timeout check
-      const elapsed = (Date.now() - startTimeRef.current) / 1000;
-      const remaining = Math.max(0, timeoutSeconds - elapsed);
-      setRemainingTime(Math.ceil(remaining));
-
-      if (elapsed >= timeoutSeconds) {
-        updateState("TIMEOUT");
         return;
       }
 
@@ -354,12 +342,6 @@ export default function LivenessFaceCapture({
         <span className="text-2xl block mb-1">{info.emoji}</span>
         <p className="font-semibold text-base">{info.text}</p>
 
-        {/* Timer */}
-        {isActive && (
-          <p className="text-xs mt-1 opacity-70">
-            Time remaining: {remainingTime}s
-          </p>
-        )}
       </div>
 
       {/* ── Progress Steps ── */}
