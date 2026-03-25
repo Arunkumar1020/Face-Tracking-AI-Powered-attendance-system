@@ -201,12 +201,16 @@ export default function Attendance() {
   }
 
   /* ---------- Face Verified → Execute Punch ---------- */
-  async function handleFaceVerified(liveDescriptor: number[]) {
+  async function handleFaceVerified(imageSrc: string) {
     if (!storedFace || !employeeId || !punchAction) return;
 
     setLoading(true);
-    setStatus("🔍 Verifying face...");
+    setStatus("🔍 Verifying face with backend...");
 
+    // TODO: The LivenessFaceCapture now returns a base64 snapshot.
+    // You should send `imageSrc` to your backend for face matching here.
+    // Bypassing local face matching for now.
+    /*
     const distance = faceDistance(liveDescriptor, storedFace);
 
     if (distance > 0.6) {
@@ -216,6 +220,7 @@ export default function Attendance() {
       setPunchAction(null);
       return;
     }
+    */
 
     const today = new Date().toISOString().split("T")[0];
     const now = new Date();

@@ -1,13 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import * as faceapi from "face-api.js";
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 /* ──────────────────────────────────────────────
    TYPES
    ────────────────────────────────────────────── */
 type Props = {
-  onCapture: (descriptor: number[]) => void;
+  // Updated from descriptor to base64 image for backend matching
+  onCapture: (imageSrc: string) => void;
   onCancel?: () => void;
   timeoutSeconds?: number;
 };
@@ -20,32 +21,7 @@ type LivenessState =
   | "SUCCESS"
   | "FAILED";
 
-/* ──────────────────────────────────────────────
-   EYE BLINK DETECTION (EAR)
-   ────────────────────────────────────────────── */
-function calculateEAR(landmarks: faceapi.FaceLandmarks68) {
-  const pts = landmarks.positions;
-
-  // Helper function to calculate Euclidean distance
-  const dist = (p1: faceapi.Point, p2: faceapi.Point) =>
-    Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
-
-  // Left eye (indices 36-41)
-  const leftEyeEAR =
-    (dist(pts[37], pts[41]) + dist(pts[38], pts[40])) / (2.0 * dist(pts[36], pts[39]));
-
-  // Right eye (indices 42-47)
-  const rightEyeEAR =
-    (dist(pts[43], pts[47]) + dist(pts[44], pts[46])) / (2.0 * dist(pts[42], pts[45]));
-
-  // Average EAR
-  return (leftEyeEAR + rightEyeEAR) / 2.0;
-}
-
-/* ──────────────────────────────────────────────
-   THRESHOLDS
-   ────────────────────────────────────────────── */
-const EAR_CLOSED_THRESHOLD = 0.20; // EAR below this is considered a blink
+type ChallengeStep = "BLINK" | "TURN" | "DONE";
 
 /* ──────────────────────────────────────────────
    INSTRUCTIONS MAP
@@ -53,7 +29,7 @@ const EAR_CLOSED_THRESHOLD = 0.20; // EAR below this is considered a blink
 const INSTRUCTIONS: Record<LivenessState, { text: string; emoji: string }> = {
   LOADING:   { text: "Loading face detection models…", emoji: "⏳" },
   WAITING:   { text: "Position your face in the frame", emoji: "🧑" },
-  BLINK:     { text: "Please BLINK your eyes", emoji: "👁️" },
+  BLINK:     { text: "Liveness Check Active", emoji: "👁️" },
   VERIFYING: { text: "Liveness verified! Capturing face…", emoji: "📸" },
   SUCCESS:   { text: "Face captured successfully!", emoji: "✅" },
   FAILED:    { text: "Detection lost. Please try again.", emoji: "⚠️" },
@@ -69,25 +45,31 @@ export default function LivenessFaceCapture({
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameRef = useRef<number>(0);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [state, setState] = useState<LivenessState>("LOADING");
   const [modelsReady, setModelsReady] = useState(false);
-  const earTextRef = useRef<HTMLDivElement>(null);
-
-  // Refs for state machine (used inside animation loop to avoid stale closures)
+  
+  // Refs for performance optimizations
   const stateRef = useRef<LivenessState>("LOADING");
-  const startTimeRef = useRef<number>(0);
+  const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
+  const lastVideoTimeRef = useRef<number>(-1);
 
-  // Blink State tracking
-  const hasClosedEyesRef = useRef<boolean>(false);
+  // State machine for liveness challenge
+  const challengeStepRef = useRef<ChallengeStep>("BLINK");
   const lostFramesRef = useRef<number>(0);
+  const liveTextRef = useRef<HTMLDivElement>(null);
 
   const updateState = useCallback((newState: LivenessState) => {
     stateRef.current = newState;
     setState(newState);
   }, []);
+
+  const updateLiveText = (text: string) => {
+    if (liveTextRef.current && liveTextRef.current.innerText !== text) {
+      liveTextRef.current.innerText = text;
+    }
+  };
 
   /* ── Load Models + Start Camera ── */
   useEffect(() => {
@@ -95,18 +77,31 @@ export default function LivenessFaceCapture({
 
     async function init() {
       try {
-        const MODEL_URL = "/models";
-        await Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-        ]);
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        
+        const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+            delegate: "GPU" // Closest mapping for IMAGE_FAST high-speed hardware acc
+          },
+          runningMode: "VIDEO",
+          outputFaceBlendshapes: true,
+          outputFacialTransformationMatrixes: false,
+          numFaces: 1
+        });
 
-        if (cancelled) return;
+        if (cancelled) {
+          faceLandmarker.close();
+          return;
+        }
+
+        faceLandmarkerRef.current = faceLandmarker;
         setModelsReady(true);
 
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
+          video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
         });
 
         if (cancelled) {
@@ -117,12 +112,16 @@ export default function LivenessFaceCapture({
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          // Explicitly call play to handle mobile browser pause behavior
           videoRef.current.play().catch(e => console.error("Video play failed:", e));
         }
 
         updateState("WAITING");
-        runDetectionLoop();
+        
+        // Wait for video to be ready before starting loop
+        videoRef.current?.addEventListener('loadeddata', () => {
+           if (!cancelled) runDetectionLoop();
+        });
+
       } catch (err) {
         console.error("Init error:", err);
         updateState("FAILED");
@@ -137,86 +136,101 @@ export default function LivenessFaceCapture({
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
       if (animFrameRef.current) {
-        clearTimeout(animFrameRef.current);
+        cancelAnimationFrame(animFrameRef.current);
       }
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
+      if (faceLandmarkerRef.current) {
+        faceLandmarkerRef.current.close();
       }
     };
   }, [updateState]);
 
   /* ── Start Liveness Challenge ── */
   function startChallenge() {
+    challengeStepRef.current = "BLINK";
     updateState("BLINK");
-    startTimeRef.current = Date.now();
-    hasClosedEyesRef.current = false;
+    updateLiveText("Please BLINK your eyes");
+    lostFramesRef.current = 0;
   }
 
-  /* ── Optimized Detection Loop ── */
+  /* ── 60 FPS Detection Loop ── */
   function runDetectionLoop() {
-    const detect = async () => {
-      // 1. Exit early if the component is in a terminal state
+    const detect = () => {
       const cs = stateRef.current;
       if (cs === "SUCCESS" || cs === "FAILED" || cs === "VERIFYING" || cs === "LOADING") return;
 
-      if (videoRef.current && videoRef.current.readyState >= 2) {
-        try {
-          const detection = await faceapi
-            .detectSingleFace(
-              videoRef.current,
-              // 2. Drop inputSize to 128 for a massive speed boost
-              new faceapi.TinyFaceDetectorOptions({ inputSize: 128, scoreThreshold: 0.5 })
-            )
-            .withFaceLandmarks();
-
-          if (detection) {
+      if (videoRef.current && videoRef.current.readyState >= 2 && faceLandmarkerRef.current) {
+        const video = videoRef.current;
+        const currentTime = video.currentTime;
+        
+        if (currentTime !== lastVideoTimeRef.current) {
+          lastVideoTimeRef.current = currentTime;
+          // Using video.currentTime mapped to ms for perfect synchronization per spec
+          const startTimeMs = currentTime * 1000;
+          
+          const result = faceLandmarkerRef.current.detectForVideo(video, startTimeMs);
+          
+          if (result.faceLandmarks && result.faceLandmarks.length > 0) {
             lostFramesRef.current = 0;
-            const currentEar = calculateEAR(detection.landmarks);
+            const landmarks = result.faceLandmarks[0];
+            const blendshapes = result.faceBlendshapes ? result.faceBlendshapes[0].categories : [];
 
-            // 3. DIRECT DOM UPDATE (Zero Re-renders)
-            if (earTextRef.current) {
-              earTextRef.current.innerText = `EAR: ${currentEar.toFixed(2)}`;
-            }
+            drawOverlay(landmarks);
 
-            drawOverlay(detection, currentEar);
-
-            // 4. State Logic (Only updates React when the state actually CHANGES)
             if (cs === "BLINK") {
-              if (currentEar < EAR_CLOSED_THRESHOLD) {
-                hasClosedEyesRef.current = true;
-              } else if (hasClosedEyesRef.current && currentEar >= EAR_CLOSED_THRESHOLD) {
-                updateState("VERIFYING");
-                hasClosedEyesRef.current = false;
-                captureAndVerify();
-                return; // Stop the loop
+              const step = challengeStepRef.current;
+              
+              if (step === "BLINK") {
+                // High-Speed Blink Detection
+                const blinkLeft = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft')?.score || 0;
+                const blinkRight = blendshapes.find(b => b.categoryName === 'eyeBlinkRight')?.score || 0;
+                
+                if (blinkLeft > 0.5 && blinkRight > 0.5) {
+                  challengeStepRef.current = "TURN";
+                  updateLiveText("Now slowly TURN your head Left or Right");
+                }
+              } 
+              else if (step === "TURN") {
+                // Motion Detection (Head Turn)
+                const nose = landmarks[1];
+                const leftEyeOuter = landmarks[33];
+                const rightEyeOuter = landmarks[263];
+                
+                const eyeCenter = (leftEyeOuter.x + rightEyeOuter.x) / 2;
+                const turnDiff = nose.x - eyeCenter;
+                
+                // Nose moves significantly left or right
+                if (turnDiff < -0.04 || turnDiff > 0.04) {
+                  challengeStepRef.current = "DONE";
+                  updateState("VERIFYING");
+                  updateLiveText("Capturing...");
+                  captureAndVerify();
+                  return; // Stop loop
+                }
               }
             }
           } else if (cs === "BLINK") {
-            // Handle lost face logic...
             lostFramesRef.current++;
-            if (lostFramesRef.current > 15) {
-               hasClosedEyesRef.current = false;
+            if (lostFramesRef.current > 30) {
                updateState("FAILED");
                return;
             }
+          } else {
+             // Clear overlay if no face
+             const canvas = canvasRef.current;
+             const ctx = canvas?.getContext("2d");
+             if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
           }
-        } catch (err) {
-          console.error("Detection error:", err);
         }
       }
 
-      // 5. Schedule next check. 30-40ms is plenty for liveness and saves CPU.
-      animFrameRef.current = window.setTimeout(detect, 33);
+      animFrameRef.current = requestAnimationFrame(detect);
     };
 
-    detect();
+    animFrameRef.current = requestAnimationFrame(detect);
   }
 
   /* ── Draw Face Overlay ── */
-  function drawOverlay(
-    detection: faceapi.WithFaceLandmarks<{ detection: faceapi.FaceDetection }>,
-    earValue: number
-  ) {
+  function drawOverlay(landmarks: Array<{x: number, y: number}>) {
     const canvas = canvasRef.current;
     const video = videoRef.current;
     if (!canvas || !video) return;
@@ -226,76 +240,49 @@ export default function LivenessFaceCapture({
 
     canvas.width = video.videoWidth || 480;
     canvas.height = video.videoHeight || 360;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Draw face bounding box
-    const box = detection.detection.box;
     const cs = stateRef.current;
     const color = cs === "BLINK" ? "#3B82F6" : "#22C55E";
 
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 3;
-    ctx.strokeRect(box.x, box.y, box.width, box.height);
-
-    // Draw landmark dots
     ctx.fillStyle = color;
-    detection.landmarks.positions.forEach((pt) => {
+    // Fast render: drawing a subset of landmarks to save compute in React
+    const importantLandmarks = [1, 33, 263, 61, 291]; // Nose, Eyes, Mouth
+    for (let point of importantLandmarks) {
+      const pt = landmarks[point];
+      if (!pt) continue;
       ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 2, 0, Math.PI * 2);
+      ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 3, 0, Math.PI * 2);
       ctx.fill();
-    });
-
-    // EAR text
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 14px monospace";
-    ctx.shadowColor = "#000";
-    ctx.shadowBlur = 4;
-    ctx.fillText(`EAR: ${earValue.toFixed(2)}`, 10, 25);
-    ctx.shadowBlur = 0;
+    }
   }
 
   /* ── Final Capture ── */
   async function captureAndVerify() {
     if (!videoRef.current) return;
 
-    let detection = null;
-    let attempts = 0;
+    // Take a high-quality snapshot
+    const canvas = document.createElement("canvas");
+    canvas.width = videoRef.current.videoWidth;
+    canvas.height = videoRef.current.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      // Draw actual video frame
+      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    }
     
-    while (!detection && attempts < 5) {
-      detection = await faceapi
-        .detectSingleFace(
-          videoRef.current,
-          new faceapi.TinyFaceDetectorOptions({ inputSize: 160 })
-        )
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-      attempts++;
-      if (!detection) {
-        await new Promise(r => setTimeout(r, 100));
-      }
-    }
-
-    if (!detection) {
-      updateState("FAILED");
-      return;
-    }
+    // Convert to base64 jpg for backend matching
+    const base64Image = canvas.toDataURL("image/jpeg", 0.95);
 
     updateState("SUCCESS");
-    const descriptor = Array.from(detection.descriptor);
 
-    // Small delay so user sees the success state
     setTimeout(() => {
-      onCapture(descriptor);
+      onCapture(base64Image);
     }, 800);
   }
 
   /* ── Retry ── */
   function handleRetry() {
-    if (earTextRef.current) {
-      earTextRef.current.innerText = "EAR: 0.00";
-    }
-    hasClosedEyesRef.current = false;
     updateState("WAITING");
     runDetectionLoop();
   }
@@ -304,9 +291,8 @@ export default function LivenessFaceCapture({
   const info = INSTRUCTIONS[state];
   const isActive = state === "BLINK";
 
-  // Progress indicator
-  const stepsDone = state === "VERIFYING" || state === "SUCCESS" ? 1 : 0;
-
+  const isBlinkDone = isActive && challengeStepRef.current === "TURN";
+  
   return (
     <div className="space-y-4">
       {/* ── Instruction Banner ── */}
@@ -321,20 +307,31 @@ export default function LivenessFaceCapture({
       >
         <span className="text-2xl block mb-1">{info.emoji}</span>
         <p className="font-semibold text-base">{info.text}</p>
-
+        
+        {isActive && (
+          <div 
+             ref={liveTextRef}
+             className="text-lg font-bold mt-2 text-blue-900 animate-pulse"
+          >
+             Please BLINK your eyes
+          </div>
+        )}
       </div>
 
-      {/* ── Progress Steps ── */}
+      {/* ── Progress Indicator ── */}
       {(isActive || state === "VERIFYING" || state === "SUCCESS") && (
-        <div className="flex justify-center gap-2">
-          <div
-            className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium transition-all ${
-              stepsDone === 1
-                ? "bg-green-500 text-white"
-                : "bg-blue-500 text-white animate-pulse"
-            }`}
-          >
-            {stepsDone === 1 ? "✓ Verified" : "Blink 1 Time"}
+        <div className="flex justify-center gap-4">
+          <div className={`px-3 py-1 rounded-full text-xs font-medium transition-all ${
+            isBlinkDone || state === "VERIFYING" || state === "SUCCESS"
+              ? "bg-green-500 text-white" : "bg-blue-500 text-white animate-pulse"
+          }`}>
+            1. Blink
+          </div>
+          <div className={`px-3 py-1 rounded-full text-xs font-medium transition-all ${
+            state === "VERIFYING" || state === "SUCCESS"
+              ? "bg-green-500 text-white" : (isBlinkDone ? "bg-blue-500 text-white animate-pulse" : "bg-gray-200 text-gray-500")
+          }`}>
+            2. Turn Head
           </div>
         </div>
       )}
@@ -354,16 +351,6 @@ export default function LivenessFaceCapture({
           className="absolute inset-0 w-full h-full pointer-events-none"
           style={{ transform: "scaleX(-1)" }}
         />
-
-        {/* Live EAR Indicator (Updated via Ref for performance) */}
-        {isActive && (
-          <div 
-            ref={earTextRef}
-            className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-lg font-mono"
-          >
-            EAR: 0.00
-          </div>
-        )}
       </div>
 
       {/* ── Action Buttons ── */}
