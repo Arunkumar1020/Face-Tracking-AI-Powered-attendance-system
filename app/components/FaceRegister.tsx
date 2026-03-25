@@ -95,16 +95,25 @@ export default function FaceRegister({
 
     setInstruction("💾 Saving face data securely…");
 
-    const { error } = await supabase
+    const { data: updated, error } = await supabase
       .from("employees")
       .update({ face_descriptor: descriptor })
-      .eq("id", employee.id);
+      .eq("employee_id", employee.employee_id)
+      .select("employee_id")
+      .single();
 
     setLoading(false);
 
     if (error) {
-      console.error(error);
-      setError("Failed to save face data.");
+      console.error("Supabase update error:", error);
+      setError(`Failed to save: ${error.message}`);
+      setInstruction("❌ Face registration failed.");
+      return;
+    }
+
+    if (!updated) {
+      console.error("No rows updated for employee_id:", employee.employee_id);
+      setError("No matching employee found to update.");
       setInstruction("❌ Face registration failed.");
       return;
     }
