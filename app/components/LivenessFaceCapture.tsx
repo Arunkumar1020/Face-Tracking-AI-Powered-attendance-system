@@ -20,7 +20,7 @@ type LivenessState =
   | "LOOK_DOWN"
   | "VERIFYING"
   | "SUCCESS"
-  | "TIMEOUT";
+  | "FAILED";
 
 /* ──────────────────────────────────────────────
    HEAD POSE ESTIMATION (from 68 landmarks)
@@ -71,7 +71,6 @@ function estimateHeadPose(landmarks: faceapi.FaceLandmarks68) {
 const YAW_LEFT_THRESHOLD = 20;    // Yaw > 20° → looking left
 const YAW_RIGHT_THRESHOLD = -20;  // Yaw < -20° → looking right
 const PITCH_DOWN_THRESHOLD = -12; // Pitch < -12° → looking down
-const DEFAULT_TIMEOUT = 10;       // seconds
 
 /* ──────────────────────────────────────────────
    INSTRUCTIONS MAP
@@ -84,7 +83,7 @@ const INSTRUCTIONS: Record<LivenessState, { text: string; emoji: string }> = {
   LOOK_DOWN: { text: "Now look DOWN", emoji: "👇" },
   VERIFYING: { text: "Liveness verified! Capturing face…", emoji: "📸" },
   SUCCESS:   { text: "Face captured successfully!", emoji: "✅" },
-  TIMEOUT:   { text: "Timed out. Please try again.", emoji: "⏰" },
+  FAILED:    { text: "Detection lost. Please try again.", emoji: "⚠️" },
 };
 
 /* ──────────────────────────────────────────────
@@ -93,7 +92,6 @@ const INSTRUCTIONS: Record<LivenessState, { text: string; emoji: string }> = {
 export default function LivenessFaceCapture({
   onCapture,
   onCancel,
-  timeoutSeconds = DEFAULT_TIMEOUT,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -150,7 +148,7 @@ export default function LivenessFaceCapture({
         updateState("WAITING");
       } catch (err) {
         console.error("Init error:", err);
-        updateState("TIMEOUT");
+        updateState("FAILED");
       }
     }
 
@@ -186,7 +184,7 @@ export default function LivenessFaceCapture({
       if (
         currentState === "VERIFYING" ||
         currentState === "SUCCESS" ||
-        currentState === "TIMEOUT" ||
+        currentState === "FAILED" ||
         currentState === "LOADING"
       ) {
         return;
@@ -298,7 +296,7 @@ export default function LivenessFaceCapture({
       .withFaceDescriptor();
 
     if (!detection) {
-      updateState("TIMEOUT");
+      updateState("FAILED");
       return;
     }
 
@@ -334,7 +332,7 @@ export default function LivenessFaceCapture({
       {/* ── Instruction Banner ── */}
       <div
         className={`rounded-xl p-4 text-center transition-all duration-300 ${
-          state === "TIMEOUT"
+          state === "FAILED"
             ? "bg-red-100 border-2 border-red-300 text-red-800"
             : state === "SUCCESS"
             ? "bg-green-100 border-2 border-green-300 text-green-800"
@@ -406,7 +404,7 @@ export default function LivenessFaceCapture({
           </button>
         )}
 
-        {state === "TIMEOUT" && (
+        {state === "FAILED" && (
           <button
             onClick={handleRetry}
             className="flex-1 py-3 rounded-xl text-lg font-semibold bg-orange-500 text-white hover:bg-orange-600 active:scale-95 transition-all"
