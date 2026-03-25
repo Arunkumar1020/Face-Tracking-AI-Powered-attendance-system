@@ -1,14 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import FaceCapture from "@/app/components/FaceCapture";
 import MobileBottomNav from "@/app/components/MobileBottomNav";
-
-/* ---------- TYPES ---------- */
-type AttendanceProps = {
-  disabled?: boolean;
-};
 
 /* ---------- CONFIG ---------- */
 //home:
@@ -16,7 +11,7 @@ const CAMPUS_LAT = 11.513944566899058;
 const CAMPUS_LNG = 77.24670983047233;
 
 //college GCE:
- //onst CAMPUS_LAT = 10.694630;
+ //const CAMPUS_LAT = 10.694630;
  //const CAMPUS_LNG = 78.979179;
 //kpr college ;
 // const CAMPUS_LAT = 11.0765000;
@@ -73,20 +68,97 @@ function faceDistance(a: number[], b: number[]) {
   );
 }
 
-/* --------jkjkbjbjbjbjbjb-- COMPONENT ---------- */
-export default function Attendance({ disabled = false }: AttendanceProps) {
-  const [employeeId, setEmployeeId] = useState("");
-  const [loading, setLoading] = useState(false);
+/* ---------- TYPES ---------- */
+type PunchAction = "punch_in" | "punch_out";
+
+/* ---------- COMPONENT ---------- */
+export default function Attendance() {
+  const [employeeId, setEmployeeId] = useState<string | null>(null);
+  const [storedFace, setStoredFace] = useState<number[] | null>(null);
+  const [loading, setLoading] = useState(true);
   const [showFace, setShowFace] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [punchAction, setPunchAction] = useState<PunchAction | null>(null);
 
-  async function startPunchIn() {
-    if (disabled) return;
+  // Track today's attendance state
+  const [hasPunchedIn, setHasPunchedIn] = useState(false);
+  const [hasPunchedOut, setHasPunchedOut] = useState(false);
+  const [todayRecord, setTodayRecord] = useState<{
+    id: string;
+    punch_in: string | null;
+    punch_out: string | null;
+    remark: string | null;
+  } | null>(null);
 
-    if (!employeeId) {
-      setStatus("❗ Please enter your Employee ID");
+  /* ✅ Load logged-in employee + today's attendance on mount */
+  useEffect(() => {
+    init();
+  }, []);
+
+  async function init() {
+    setLoading(true);
+
+    // 1. Get logged-in user
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    if (!user?.email) {
+      setStatus("❌ Not logged in. Please login first.");
+      setLoading(false);
       return;
     }
+
+    // 2. Get employee record by email
+    const { data: employee, error } = await supabase
+      .from("employees")
+      .select("employee_id, face_descriptor")
+      .eq("email", user.email)
+      .single();
+
+    if (error || !employee) {
+      setStatus("❌ Employee record not found for your account.");
+      setLoading(false);
+      return;
+    }
+
+    setEmployeeId(employee.employee_id);
+    setStoredFace(employee.face_descriptor);
+
+    if (
+      !Array.isArray(employee.face_descriptor) ||
+      employee.face_descriptor.length === 0
+    ) {
+      setStatus(
+        "⚠️ Face not registered. Please contact admin before punching attendance."
+      );
+      setLoading(false);
+      return;
+    }
+
+    // 3. Check today's attendance record
+    const today = new Date().toISOString().split("T")[0];
+    const { data: existing } = await supabase
+      .from("attendance")
+      .select("id, punch_in, punch_out, remark")
+      .eq("employee_id", employee.employee_id)
+      .eq("date", today)
+      .single();
+
+    if (existing) {
+      setTodayRecord(existing);
+      setHasPunchedIn(!!existing.punch_in);
+      setHasPunchedOut(!!existing.punch_out);
+    }
+
+    setLoading(false);
+  }
+
+  /* ---------- Start Punch (In or Out) ---------- */
+  async function startPunch(action: PunchAction) {
+    if (!employeeId || !storedFace) return;
+
+    setPunchAction(action);
 
     if (!navigator.geolocation) {
       setStatus("❌ GPS not supported on this device");
@@ -110,6 +182,7 @@ export default function Attendance({ disabled = false }: AttendanceProps) {
         if (distance > ALLOWED_RADIUS) {
           setStatus("❌ You are outside the allowed campus area");
           setLoading(false);
+          setPunchAction(null);
           return;
         }
 
@@ -120,116 +193,227 @@ export default function Attendance({ disabled = false }: AttendanceProps) {
       () => {
         setStatus("❌ Location permission denied");
         setLoading(false);
+        setPunchAction(null);
       }
     );
   }
 
+  /* ---------- Face Verified → Execute Punch ---------- */
   async function handleFaceVerified(liveDescriptor: number[]) {
+    if (!storedFace || !employeeId || !punchAction) return;
+
     setLoading(true);
     setStatus("🔍 Verifying face...");
 
-    const { data: employee, error } = await supabase
-      .from("employees")
-      .select("id, face_descriptor")
-      .eq("employee_id", employeeId)
-      .single();
+    const distance = faceDistance(liveDescriptor, storedFace);
 
-    if (error || !employee?.face_descriptor) {
-      setStatus("❌ Face not registered for this employee");
-      setLoading(false);
-      return;
-    }
-
-    const distance = faceDistance(
-      liveDescriptor,
-      employee.face_descriptor
-    );
-  
     if (distance > 0.6) {
-      setStatus("❌ Face mismatch. Attendance denied");
+      setStatus("❌ Face mismatch. Attendance denied.");
       setLoading(false);
+      setShowFace(false);
+      setPunchAction(null);
       return;
     }
 
     const today = new Date().toISOString().split("T")[0];
+    const now = new Date();
 
-    const { data: existing } = await supabase
+    if (punchAction === "punch_in") {
+      // ── PUNCH IN ──
+      const { data: existing } = await supabase
+        .from("attendance")
+        .select("id")
+        .eq("employee_id", employeeId)
+        .eq("date", today)
+        .single();
+
+      if (existing) {
+        setStatus("⚠️ Already punched in today");
+        setLoading(false);
+        setShowFace(false);
+        setPunchAction(null);
+        return;
+      }
+
+      const attendanceResult = getAttendanceStatus(now);
+
+      const { error: insertError } = await supabase
+        .from("attendance")
+        .insert({
+          employee_id: employeeId,
+          date: today,
+          punch_in: now.toISOString(),
+          status: attendanceResult.status,
+          remark: attendanceResult.remark,
+        });
+
+      if (insertError) {
+        setStatus(`❌ ${insertError.message}`);
+      } else {
+        setStatus(`✅ Punched In (${attendanceResult.remark})`);
+        setHasPunchedIn(true);
+      }
+    } else {
+      // ── PUNCH OUT ──
+      const { data: record } = await supabase
+        .from("attendance")
+        .select("id, punch_out")
+        .eq("employee_id", employeeId)
+        .eq("date", today)
+        .single();
+
+      if (!record) {
+        setStatus("⚠️ No punch-in found for today. Punch in first!");
+        setLoading(false);
+        setShowFace(false);
+        setPunchAction(null);
+        return;
+      }
+
+      if (record.punch_out) {
+        setStatus("⚠️ Already punched out today");
+        setLoading(false);
+        setShowFace(false);
+        setPunchAction(null);
+        return;
+      }
+
+      const { error: updateError } = await supabase
+        .from("attendance")
+        .update({ punch_out: now.toISOString() })
+        .eq("id", record.id);
+
+      if (updateError) {
+        setStatus(`❌ ${updateError.message}`);
+      } else {
+        setStatus("✅ Punched Out successfully");
+        setHasPunchedOut(true);
+      }
+    }
+
+    setShowFace(false);
+    setLoading(false);
+    setPunchAction(null);
+
+    // Refresh today's record
+    await refreshTodayRecord();
+  }
+
+  async function refreshTodayRecord() {
+    if (!employeeId) return;
+    const today = new Date().toISOString().split("T")[0];
+    const { data } = await supabase
       .from("attendance")
-      .select("id")
+      .select("id, punch_in, punch_out, remark")
       .eq("employee_id", employeeId)
       .eq("date", today)
       .single();
 
-    if (existing) {
-      setStatus("⚠️ Attendance already marked today");
-      setLoading(false);
-      return;
+    if (data) {
+      setTodayRecord(data);
+      setHasPunchedIn(!!data.punch_in);
+      setHasPunchedOut(!!data.punch_out);
     }
-
-    // ✅ APPLY RULE ENGINE
-    const punchInTime = new Date();
-    const attendanceResult = getAttendanceStatus(punchInTime);
-
-    const { error: insertError } = await supabase
-      .from("attendance")
-      .insert({
-        employee_id: employeeId,
-        date: today,
-        punch_in: punchInTime.toISOString(),
-        status: attendanceResult.status,
-        remark: attendanceResult.remark,
-      });
-
-    if (insertError) {
-      setStatus(insertError.message);
-    } else {
-      setStatus(
-        `✅ Attendance marked (${attendanceResult.remark})`
-      );
-    }
-
-    setEmployeeId("");
-    setShowFace(false);
-    setLoading(false);
   }
+
+  /* ---------- Format time for display ---------- */
+  function formatTime(isoString: string | null) {
+    if (!isoString) return "--:--";
+    return new Date(isoString).toLocaleTimeString("en-IN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    });
+  }
+
+  /* ---------- UI ---------- */
+  const isPunchInDisabled = hasPunchedIn || loading;
+  const isPunchOutDisabled = !hasPunchedIn || hasPunchedOut || loading;
 
   return (
     <div className="min-h-screen bg-blue-50 flex items-center justify-center px-4 pb-20">
-      <div className="w-full max-w-md bg-white rounded-2xl shadow-xl p-6 space-y-4">
+      <div className="w-full max-w-md bg-white rounded-2xl shadow-xl p-6 space-y-5">
         <h2 className="text-2xl font-bold text-center text-blue-700">
-          Attendance Punch
+          Attendance
         </h2>
 
+        {/* ── Status Message ── */}
         {status && (
           <div className="text-center text-sm bg-blue-100 text-blue-900 p-3 rounded-lg">
             {status}
           </div>
         )}
 
-        {!showFace && (
-          <div className="space-y-4">
-            <input
-              className="w-full rounded-lg border border-blue-300 px-4 py-3 text-gray-900"
-              placeholder="Enter Employee ID"
-              value={employeeId}
-              disabled={disabled}
-              onChange={(e) => setEmployeeId(e.target.value)}
-            />
+        {/* ── Today's Summary ── */}
+        {todayRecord && (
+          <div className="bg-gray-50 rounded-xl p-4 space-y-2">
+            <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide">
+              Today&apos;s Record
+            </h3>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-600">Punch In</span>
+              <span className="font-medium text-green-700">
+                {formatTime(todayRecord.punch_in)}
+              </span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-600">Punch Out</span>
+              <span className="font-medium text-red-600">
+                {formatTime(todayRecord.punch_out)}
+              </span>
+            </div>
+            {todayRecord.remark && (
+              <div className="flex justify-between text-sm">
+                <span className="text-gray-600">Remark</span>
+                <span className="font-medium text-blue-700">
+                  {todayRecord.remark}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── Punch In / Punch Out Buttons ── */}
+        {!showFace && !loading && (
+          <div className="flex gap-3">
+            <button
+              onClick={() => startPunch("punch_in")}
+              disabled={isPunchInDisabled}
+              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${
+                isPunchInDisabled
+                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  : "bg-green-600 text-white hover:bg-green-700 active:scale-95"
+              }`}
+            >
+              Punch In
+            </button>
 
             <button
-              onClick={startPunchIn}
-              disabled={loading || disabled}
-              className="w-full py-3 rounded-lg text-lg font-semibold bg-blue-600 text-white"
+              onClick={() => startPunch("punch_out")}
+              disabled={isPunchOutDisabled}
+              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${
+                isPunchOutDisabled
+                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  : "bg-red-600 text-white hover:bg-red-700 active:scale-95"
+              }`}
             >
-              {loading ? "Checking..." : "Punch In"}
+              Punch Out
             </button>
           </div>
         )}
 
+        {/* ── Loading Spinner ── */}
+        {loading && !showFace && (
+          <div className="text-center py-4">
+            <div className="inline-block w-8 h-8 border-4 border-blue-300 border-t-blue-600 rounded-full animate-spin" />
+          </div>
+        )}
+
+        {/* ── Face Verification ── */}
         {showFace && (
           <div className="space-y-3">
             <p className="text-sm text-center text-gray-600">
-              Step 2: Face Verification
+              Face Verification
             </p>
             <FaceCapture onCapture={handleFaceVerified} />
           </div>
