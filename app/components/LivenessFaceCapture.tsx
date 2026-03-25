@@ -59,6 +59,8 @@ export default function LivenessFaceCapture({
   const challengeStepRef = useRef<ChallengeStep>("BLINK");
   const lostFramesRef = useRef<number>(0);
   const liveTextRef = useRef<HTMLDivElement>(null);
+  const frameCountRef = useRef<number>(0);
+  const hasClosedEyesRef = useRef<boolean>(false);
 
   const updateState = useCallback((newState: LivenessState) => {
     stateRef.current = newState;
@@ -78,7 +80,7 @@ export default function LivenessFaceCapture({
     async function init() {
       try {
         const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
         );
         
         const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
@@ -150,6 +152,8 @@ export default function LivenessFaceCapture({
     updateState("BLINK");
     updateLiveText("Please BLINK your eyes");
     lostFramesRef.current = 0;
+    hasClosedEyesRef.current = false;
+    frameCountRef.current = 0;
   }
 
   /* ── 60 FPS Detection Loop ── */
@@ -158,67 +162,81 @@ export default function LivenessFaceCapture({
       const cs = stateRef.current;
       if (cs === "SUCCESS" || cs === "FAILED" || cs === "VERIFYING" || cs === "LOADING") return;
 
+      frameCountRef.current++;
+
       if (videoRef.current && videoRef.current.readyState >= 2 && faceLandmarkerRef.current) {
-        const video = videoRef.current;
-        const currentTime = video.currentTime;
-        
-        if (currentTime !== lastVideoTimeRef.current) {
-          lastVideoTimeRef.current = currentTime;
-          // Using video.currentTime mapped to ms for perfect synchronization per spec
-          const startTimeMs = currentTime * 1000;
+        // Frame Skipper: run heavy AI detection every 2nd frame (~15-30 FPS on mobile, saving battery)
+        if (frameCountRef.current % 2 === 0) {
+          const video = videoRef.current;
+          const currentTime = video.currentTime;
           
-          const result = faceLandmarkerRef.current.detectForVideo(video, startTimeMs);
-          
-          if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-            lostFramesRef.current = 0;
-            const landmarks = result.faceLandmarks[0];
-            const blendshapes = result.faceBlendshapes ? result.faceBlendshapes[0].categories : [];
+          if (currentTime !== lastVideoTimeRef.current) {
+            lastVideoTimeRef.current = currentTime;
+            // Using video.currentTime mapped to ms for perfect synchronization per spec
+            const startTimeMs = currentTime * 1000;
+            
+            const result = faceLandmarkerRef.current.detectForVideo(video, startTimeMs);
+            
+            if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+              lostFramesRef.current = 0;
+              const landmarks = result.faceLandmarks[0];
+              const blendshapes = result.faceBlendshapes ? result.faceBlendshapes[0].categories : [];
 
-            drawOverlay(landmarks);
+              drawOverlay(landmarks);
 
-            if (cs === "BLINK") {
-              const step = challengeStepRef.current;
-              
-              if (step === "BLINK") {
-                // High-Speed Blink Detection
-                const blinkLeft = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft')?.score || 0;
-                const blinkRight = blendshapes.find(b => b.categoryName === 'eyeBlinkRight')?.score || 0;
+              if (cs === "BLINK") {
+                const step = challengeStepRef.current;
                 
-                if (blinkLeft > 0.5 && blinkRight > 0.5) {
-                  challengeStepRef.current = "TURN";
-                  updateLiveText("Now slowly TURN your head Left or Right");
-                }
-              } 
-              else if (step === "TURN") {
-                // Motion Detection (Head Turn)
-                const nose = landmarks[1];
-                const leftEyeOuter = landmarks[33];
-                const rightEyeOuter = landmarks[263];
-                
-                const eyeCenter = (leftEyeOuter.x + rightEyeOuter.x) / 2;
-                const turnDiff = nose.x - eyeCenter;
-                
-                // Nose moves significantly left or right
-                if (turnDiff < -0.04 || turnDiff > 0.04) {
-                  challengeStepRef.current = "DONE";
-                  updateState("VERIFYING");
-                  updateLiveText("Capturing...");
-                  captureAndVerify();
-                  return; // Stop loop
+                if (step === "BLINK") {
+                  // High-Speed Blink Detection
+                  const blinkLeft = blendshapes.find(b => b.categoryName === 'eyeBlinkLeft')?.score || 0;
+                  const blinkRight = blendshapes.find(b => b.categoryName === 'eyeBlinkRight')?.score || 0;
+                  
+                  if (!hasClosedEyesRef.current) {
+                    // Check if eyes are fully closed
+                    if (blinkLeft > 0.45 && blinkRight > 0.45) {
+                      hasClosedEyesRef.current = true;
+                    }
+                  } else {
+                    // Eyes were closed, wait for them to re-open to complete the blink
+                    if (blinkLeft < 0.45 && blinkRight < 0.45) {
+                      challengeStepRef.current = "TURN";
+                      updateLiveText("Now slowly TURN your head Left or Right");
+                    }
+                  }
+                } 
+                else if (step === "TURN") {
+                  // Motion Detection (Head Turn) using relative position to eyes
+                  const nose = landmarks[1];
+                  const leftEyeOuter = landmarks[33];
+                  const rightEyeOuter = landmarks[263];
+                  
+                  const eyeCenter = (leftEyeOuter.x + rightEyeOuter.x) / 2;
+                  const turnDiff = nose.x - eyeCenter;
+                  
+                  // Nose moves significantly left or right
+                  if (turnDiff < -0.04 || turnDiff > 0.04) {
+                    challengeStepRef.current = "DONE";
+                    updateState("VERIFYING");
+                    updateLiveText("Capturing...");
+                    captureAndVerify();
+                    return; // Stop loop
+                  }
                 }
               }
+            } else if (cs === "BLINK") {
+              lostFramesRef.current++;
+              // Scale max lost frames by 2 since we skip 50% of frames
+              if (lostFramesRef.current > 15) {
+                 updateState("FAILED");
+                 return;
+              }
+            } else {
+               // Clear overlay if no face
+               const canvas = canvasRef.current;
+               const ctx = canvas?.getContext("2d");
+               if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
             }
-          } else if (cs === "BLINK") {
-            lostFramesRef.current++;
-            if (lostFramesRef.current > 30) {
-               updateState("FAILED");
-               return;
-            }
-          } else {
-             // Clear overlay if no face
-             const canvas = canvasRef.current;
-             const ctx = canvas?.getContext("2d");
-             if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
           }
         }
       }
