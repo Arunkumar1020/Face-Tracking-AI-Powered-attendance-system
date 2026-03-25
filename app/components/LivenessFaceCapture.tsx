@@ -16,13 +16,12 @@ type Props = {
 type LivenessState =
   | "LOADING"
   | "WAITING"
-  | "BLINK"
+  | "TURN"
   | "VERIFYING"
   | "SUCCESS"
   | "FAILED";
 
-// Blink state kept under the hood so the main attendance page doesn't crash on enum changes
-// but the actual action is now just a Head Turn.
+// Active tracking is now just a Head Turn.
 
 /* ──────────────────────────────────────────────
    INSTRUCTIONS MAP
@@ -30,7 +29,7 @@ type LivenessState =
 const INSTRUCTIONS: Record<LivenessState, { text: string; emoji: string }> = {
   LOADING:   { text: "Loading face detection models…", emoji: "⏳" },
   WAITING:   { text: "Position your face in the frame", emoji: "🧑" },
-  BLINK:     { text: "Liveness Check Active", emoji: "👁️" },
+  TURN:      { text: "Liveness Check Active", emoji: "🔄" },
   VERIFYING: { text: "Liveness verified! Capturing face…", emoji: "📸" },
   SUCCESS:   { text: "Face captured successfully!", emoji: "✅" },
   FAILED:    { text: "Detection lost. Please try again.", emoji: "⚠️" },
@@ -147,7 +146,7 @@ export default function LivenessFaceCapture({
 
   /* ── Start Liveness Challenge ── */
   function startChallenge() {
-    updateState("BLINK");
+    updateState("TURN");
     updateLiveText("Slowly TURN your head Left or Right");
     lostFramesRef.current = 0;
     frameCountRef.current = 0;
@@ -180,7 +179,7 @@ export default function LivenessFaceCapture({
 
               drawOverlay(landmarks);
 
-              if (cs === "BLINK") {
+              if (cs === "TURN") {
                 // Motion Detection (Head Turn) using relative position to eyes
                 const nose = landmarks[1];
                 const leftEyeOuter = landmarks[33];
@@ -197,7 +196,7 @@ export default function LivenessFaceCapture({
                   return; // Stop loop
                 }
               }
-            } else if (cs === "BLINK") {
+            } else if (cs === "TURN") {
               lostFramesRef.current++;
               // Scale max lost frames by 2 since we skip 50% of frames
               if (lostFramesRef.current > 15) {
@@ -234,7 +233,7 @@ export default function LivenessFaceCapture({
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const cs = stateRef.current;
-    const color = cs === "BLINK" ? "#3B82F6" : "#22C55E";
+    const color = cs === "TURN" ? "#3B82F6" : "#22C55E";
 
     ctx.fillStyle = color;
     // Fast render: drawing a subset of landmarks to save compute in React
@@ -280,7 +279,7 @@ export default function LivenessFaceCapture({
 
   /* ── UI ── */
   const info = INSTRUCTIONS[state];
-  const isActive = state === "BLINK";
+  const isActive = state === "TURN";
   
   return (
     <div className="space-y-4">
