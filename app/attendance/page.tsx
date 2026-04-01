@@ -10,21 +10,14 @@ import MobileBottomNav from "@/app/components/MobileBottomNav";
 //home:
 const CAMPUS_LAT = 10.912951767776038;
 const CAMPUS_LNG = 78.0272063956743;
-
-
-
-
-
-
-
 //college GCE:
- //const CAMPUS_LAT = 10.694630;
- //const CAMPUS_LNG = 78.979179;
+//const CAMPUS_LAT = 10.694630;
+//const CAMPUS_LNG = 78.979179;
 //kpr college ;
 // const CAMPUS_LAT = 11.0765000;
 // const CAMPUS_LNG = 77.1420000;
 
-const ALLOWED_RADIUS = 20000; // meters
+const ALLOWED_RADIUS = 200; // meters
 
 // ✅ ATTENDANCE RULES
 const OFFICE_START_TIME = "09:30";
@@ -63,8 +56,8 @@ function getDistanceInMeters(
   const a =
     Math.sin(dLat / 2) ** 2 +
     Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) ** 2;
+    Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLon / 2) ** 2;
 
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
@@ -217,9 +210,9 @@ export default function Attendance() {
         setPunchAction(null);
       },
       {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0,
+        enableHighAccuracy: false, // GPS can timeout indoors. Setting to false uses faster Wi-Fi/Cellular signals
+        timeout: 30000,            // Give it 30 seconds instead of 15 seconds
+        maximumAge: 10000,         // Allow locations cached in the last 10 seconds to speed it up
       }
     );
   }
@@ -438,11 +431,10 @@ export default function Attendance() {
             <button
               onClick={() => startPunch("punch_in")}
               disabled={isPunchInDisabled}
-              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${
-                isPunchInDisabled
-                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
-                  : "bg-green-600 text-white hover:bg-green-700 active:scale-95"
-              }`}
+              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${isPunchInDisabled
+                ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                : "bg-green-600 text-white hover:bg-green-700 active:scale-95"
+                }`}
             >
               Punch In
             </button>
@@ -450,11 +442,10 @@ export default function Attendance() {
             <button
               onClick={() => startPunch("punch_out")}
               disabled={isPunchOutDisabled}
-              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${
-                isPunchOutDisabled
-                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
-                  : "bg-red-600 text-white hover:bg-red-700 active:scale-95"
-              }`}
+              className={`flex-1 py-3 rounded-lg text-lg font-semibold transition-all ${isPunchOutDisabled
+                ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                : "bg-red-600 text-white hover:bg-red-700 active:scale-95"
+                }`}
             >
               Punch Out
             </button>
