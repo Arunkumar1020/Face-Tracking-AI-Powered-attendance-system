@@ -8,14 +8,14 @@ import MobileBottomNav from "@/app/components/MobileBottomNav";
 
 /* ---------- CONFIG ---------- */
 //home:
-//const CAMPUS_LAT = 11.503639884280672;
-//const CAMPUS_LNG = 77.24349695299837;
+const CAMPUS_LAT = 11.503639884280672;
+const CAMPUS_LNG = 77.24349695299837;
 //college GCE:
 //const CAMPUS_LAT = 10.694630;
 //const CAMPUS_LNG = 78.979179;
 //kpr college ;
-const CAMPUS_LAT = 11.0765000;
-const CAMPUS_LNG = 77.1420000;
+//const CAMPUS_LAT = 11.0765000;
+//const CAMPUS_LNG = 77.1420000;
 
 const ALLOWED_RADIUS = 2000; // meters
 
